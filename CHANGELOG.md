@@ -33,6 +33,20 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Experimental Event Groups APIs: `EventGroup`, `WorkflowContext::create_event_group`,
+  `with_event_group` / `with_event_groups`, and `event_groups` on timer, activity, local
+  activity, child workflow, signal-external, Nexus operation, continue-as-new, wait-condition
+  timeout, and cancel-external options (`ExternalWorkflowHandle::cancel_with_options`).
+  Signal and update handlers automatically attach an implicit inbound group. This API may
+  change without notice.
+* `WaitConditionOptions::timeout` starts a workflow timer and completes the wait with
+  `Ok(false)` when the timer fires before the condition becomes true.
+
+### Breaking Changes
+* `WorkflowContext::wait_condition_with_options` now returns `Result<bool, WorkflowCancellationError>`:
+  `Ok(true)` when the condition becomes true, `Ok(false)` when `WaitConditionOptions::timeout` fires.
+
 ## [1.0.0] - 2026-09-04
 
 ### Changed

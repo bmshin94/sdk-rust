@@ -14,11 +14,17 @@ pub use options::{
 };
 #[cfg(feature = "experimental")]
 pub use options::{
-    ContinueAsNewVersioningBehavior, NexusOperationCancellationType, NexusOperationOptions,
+    CancelExternalWorkflowOptions, ContinueAsNewVersioningBehavior, NexusOperationCancellationType,
+    NexusOperationOptions,
 };
 pub use temporalio_common_wasm::error::StartChildWorkflowExecutionFailedCause;
 pub use view::{NamespacedWorkflowInfo, WorkflowContextView};
 
+#[cfg(feature = "experimental")]
+use crate::{
+    EventGroup,
+    event_groups::{ActiveEventGroups, merge_command_markers},
+};
 use crate::{
     MemoValue, WorkflowCancellationError, WorkflowCancellationToken,
     runtime::{
@@ -98,7 +104,7 @@ use temporalio_common_wasm::{
                 ModifyWorkflowProperties, RequestCancelActivity,
                 RequestCancelExternalWorkflowExecution, RequestCancelLocalActivity,
                 RequestCancelNexusOperation, SetPatchMarker, UpsertWorkflowSearchAttributes,
-                signal_external_workflow_execution, workflow_command,
+                WorkflowCommand, signal_external_workflow_execution, workflow_command,
             },
         },
         temporal::api::{
@@ -268,6 +274,8 @@ impl WorkflowRandomState {
 #[derive(Clone)]
 pub struct BaseWorkflowContext {
     inner: Rc<WorkflowContextInner>,
+    #[cfg(feature = "experimental")]
+    event_groups: ActiveEventGroups,
 }
 
 /// A typed key for values stored in the current workflow execution context.
@@ -916,6 +924,85 @@ impl BaseWorkflowContext {
                 context_values,
                 workflow_interceptors,
             }),
+            #[cfg(feature = "experimental")]
+            event_groups: ActiveEventGroups::default(),
+        }
+    }
+
+    fn push_user_command(&self, command: WorkflowCommand) {
+        #[cfg(feature = "experimental")]
+        let command = {
+            let mut command = command;
+            command.event_group_markers = merge_command_markers(
+                &self.event_groups,
+                std::mem::take(&mut command.event_group_markers),
+            );
+            command
+        };
+        self.inner.runtime.host.push_command(command);
+    }
+
+    #[cfg(feature = "experimental")]
+    fn original_execution_run_id(&self) -> &str {
+        &self.inner.initial_information.original_execution_run_id
+    }
+
+    /// Create an Event Group whose id is derived from this workflow's original execution run id
+    /// and `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` is empty.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn create_event_group(&self, label: impl Into<String>) -> EventGroup {
+        EventGroup::derived(label, self.original_execution_run_id())
+    }
+
+    /// Return a derived context that attaches `group` to every command issued through it.
+    ///
+    /// Nested derivations compose: commands carry the union of enclosing groups. Direct
+    /// `event_groups` on command options are added to this set.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_group(&self, group: EventGroup) -> Self {
+        self.with_event_groups([group])
+    }
+
+    /// Return a derived context that attaches each of `groups` to every command issued through it.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_groups: self.event_groups.with_explicit(groups),
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    pub(crate) fn with_implicit_inbound_event(&self, event_id: i64) -> Self {
+        match EventGroup::inbound_event(event_id) {
+            Some(group) => Self {
+                inner: self.inner.clone(),
+                event_groups: self.event_groups.with_implicit(group),
+            },
+            None => self.clone(),
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    pub(crate) fn with_implicit_inbound_update(&self, update_id: impl Into<String>) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            event_groups: self
+                .event_groups
+                .with_implicit(EventGroup::inbound_update(update_id)),
         }
     }
 
@@ -1120,11 +1207,7 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::Timer(seq), unblocker);
-            base_ctx
-                .inner
-                .runtime
-                .host
-                .push_command(opts.into_command(seq));
+            base_ctx.push_user_command(opts.into_command(seq));
             CancellableWorkflowOutboundFuture::new(
                 cmd,
                 base_ctx.cancellation_handle(CancellableID::Timer(seq)),
@@ -1192,7 +1275,7 @@ impl BaseWorkflowContext {
                     if opts.task_queue.is_none() {
                         opts.task_queue = Some(base_ctx.inner.task_queue.clone());
                     }
-                    base_ctx.inner.runtime.host.push_command(opts.into_command(
+                    base_ctx.push_user_command(opts.into_command(
                         seq,
                         activity_type,
                         payloads,
@@ -1392,7 +1475,7 @@ impl BaseWorkflowContext {
                 PendingCommandId::ChildWorkflowComplete(child_seq),
                 unblocker,
             );
-            base_ctx.inner.runtime.host.push_command(opts.into_command(
+            base_ctx.push_user_command(opts.into_command(
                 child_seq,
                 workflow_type,
                 payloads,
@@ -1459,12 +1542,7 @@ impl BaseWorkflowContext {
         self.inner
             .runtime
             .register_unblocker(PendingCommandId::Activity(seq), unblocker);
-        self.inner.runtime.host.push_command(opts.into_command(
-            seq,
-            activity_type,
-            arguments,
-            headers,
-        ));
+        self.push_user_command(opts.into_command(seq, activity_type, arguments, headers));
         cmd
     }
 
@@ -1543,11 +1621,13 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::SignalExternal(seq), unblocker);
-            base_ctx
-                .inner
-                .runtime
-                .host
-                .push_command(options.into_command(seq, signal_name, payloads, headers, target));
+            base_ctx.push_user_command(options.into_command(
+                seq,
+                signal_name,
+                payloads,
+                headers,
+                target,
+            ));
             cancellable_outbound(SignalChildFut::Running {
                 inner: cmd,
                 data_converter: base_ctx.data_converter().clone(),
@@ -1593,7 +1673,11 @@ impl BaseWorkflowContext {
                 .inner
                 .runtime
                 .register_unblocker(PendingCommandId::CancelExternal(seq), unblocker);
-            base_ctx.inner.runtime.host.push_command(
+            #[cfg(feature = "experimental")]
+            let extra_markers = EventGroup::to_markers(input.event_groups);
+            #[cfg(not(feature = "experimental"))]
+            let extra_markers = Vec::new();
+            let mut command: WorkflowCommand =
                 workflow_command::Variant::RequestCancelExternalWorkflowExecution(
                     RequestCancelExternalWorkflowExecution {
                         seq,
@@ -1605,8 +1689,9 @@ impl BaseWorkflowContext {
                         reason: input.reason.unwrap_or_default(),
                     },
                 )
-                .into(),
-            );
+                .into();
+            command.event_group_markers = extra_markers;
+            base_ctx.push_user_command(command);
             let data_converter = base_ctx.data_converter().clone();
             WorkflowOutboundFuture::new(async move {
                 match cmd.await {
@@ -1653,6 +1738,45 @@ impl<W> SyncWorkflowContext<W> {
         f: impl FnOnce() -> R,
     ) -> R {
         self.base.with_context_value_sync::<K, R>(value, f)
+    }
+
+    /// Create an Event Group whose id is derived from this workflow's original execution run id
+    /// and `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` is empty.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn create_event_group(&self, label: impl Into<String>) -> EventGroup {
+        self.base.create_event_group(label)
+    }
+
+    /// Return a derived context that attaches `group` to every command issued through it.
+    ///
+    /// Nested derivations compose: commands carry the union of enclosing groups. Direct
+    /// `event_groups` on command options are added to this set.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_group(&self, group: EventGroup) -> Self {
+        self.with_event_groups([group])
+    }
+
+    /// Return a derived context that attaches each of `groups` to every command issued through it.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
+        Self {
+            base: self.base.with_event_groups(groups),
+            headers: self.headers.clone(),
+            _phantom: PhantomData,
+        }
     }
 
     /// Return the workflow's unique identifier
@@ -1857,8 +1981,19 @@ impl<W> SyncWorkflowContext<W> {
             let arguments = pc
                 .to_payloads(&ctx, &*input)
                 .map_err(WorkflowTermination::from)?;
-            let request = opts.into_request(workflow_type, arguments, headers, pc)?;
-            Err(WorkflowTermination::continue_as_new(request))
+            #[cfg(feature = "experimental")]
+            let extra_markers = EventGroup::to_markers(opts.event_groups.clone());
+            let attributes = opts.into_request(workflow_type, arguments, headers, pc)?;
+            #[cfg(feature = "experimental")]
+            let event_group_markers = merge_command_markers(&base_ctx.event_groups, extra_markers);
+            #[cfg(not(feature = "experimental"))]
+            let event_group_markers = Vec::new();
+            Err(WorkflowTermination::continue_as_new(
+                crate::runtime::types::ContinueAsNewRequest {
+                    attributes,
+                    event_group_markers,
+                },
+            ))
         });
         let interceptors = self.base.inner.workflow_interceptors.clone();
         call_continue_as_new(
@@ -2006,7 +2141,7 @@ impl<W> SyncWorkflowContext<W> {
         };
 
         if res {
-            self.base.inner.runtime.host.push_command(
+            self.base.push_user_command(
                 workflow_command::Variant::SetPatchMarker(SetPatchMarker {
                     patch_id: patch_id.to_string(),
                     deprecated,
@@ -2059,7 +2194,7 @@ impl<W> SyncWorkflowContext<W> {
         }
 
         let proto = SearchAttributes::updates_to_proto(updates);
-        self.base.inner.runtime.host.push_command(
+        self.base.push_user_command(
             workflow_command::Variant::UpsertWorkflowSearchAttributes(
                 UpsertWorkflowSearchAttributes {
                     search_attributes: Some(proto),
@@ -2110,7 +2245,7 @@ impl<W> SyncWorkflowContext<W> {
                 }
             }
         }
-        self.base.inner.runtime.host.push_command(
+        self.base.push_user_command(
             workflow_command::Variant::ModifyWorkflowProperties(ModifyWorkflowProperties {
                 upserted_memo: Some(ProtoMemo { fields }),
             })
@@ -2206,6 +2341,69 @@ impl<W> WorkflowContext<W> {
         f: impl FnOnce() -> R,
     ) -> R {
         self.sync.with_context_value_sync::<K, R>(value, f)
+    }
+
+    /// Create an Event Group whose id is derived from this workflow's original execution run id
+    /// and `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `label` is empty.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn create_event_group(&self, label: impl Into<String>) -> EventGroup {
+        self.sync.create_event_group(label)
+    }
+
+    /// Return a derived context that attaches `group` to every command issued through it.
+    ///
+    /// Nested derivations compose: commands carry the union of enclosing groups. Direct
+    /// `event_groups` on command options are added to this set. Clone this derived context into
+    /// concurrent futures so they keep the attached groups.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_group(&self, group: EventGroup) -> Self {
+        self.with_event_groups([group])
+    }
+
+    /// Return a derived context that attaches each of `groups` to every command issued through it.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn with_event_groups(&self, groups: impl IntoIterator<Item = EventGroup>) -> Self {
+        Self {
+            sync: self.sync.with_event_groups(groups),
+            workflow_state: self.workflow_state.clone(),
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    pub(crate) fn with_implicit_inbound_event(&self, event_id: i64) -> Self {
+        Self {
+            sync: SyncWorkflowContext {
+                base: self.sync.base.with_implicit_inbound_event(event_id),
+                headers: self.sync.headers.clone(),
+                _phantom: PhantomData,
+            },
+            workflow_state: self.workflow_state.clone(),
+        }
+    }
+
+    #[cfg(feature = "experimental")]
+    pub(crate) fn with_implicit_inbound_update(&self, update_id: impl Into<String>) -> Self {
+        Self {
+            sync: SyncWorkflowContext {
+                base: self.sync.base.with_implicit_inbound_update(update_id),
+                headers: self.sync.headers.clone(),
+                _phantom: PhantomData,
+            },
+            workflow_state: self.workflow_state.clone(),
+        }
     }
 
     /// Return the workflow's unique identifier
@@ -2545,14 +2743,19 @@ impl<W> WorkflowContext<W> {
         condition: impl FnMut(&W) -> bool + 'a,
     ) -> impl FusedFuture<Output = Result<(), WorkflowCancellationError>> + 'a {
         self.wait_condition_with_options(condition, Default::default())
+            .map(|result| result.map(|_| ()))
+            .fuse()
     }
 
     /// Wait for some condition on workflow state to become true with the provided options.
+    ///
+    /// Returns `Ok(true)` when the condition becomes true, `Ok(false)` when
+    /// [`WaitConditionOptions::timeout`] fires first, and `Err` when the wait is cancelled.
     pub fn wait_condition_with_options<'a>(
         &'a self,
         mut condition: impl FnMut(&W) -> bool + 'a,
         options: WaitConditionOptions,
-    ) -> impl FusedFuture<Output = Result<(), WorkflowCancellationError>> + 'a {
+    ) -> impl FusedFuture<Output = Result<bool, WorkflowCancellationError>> + 'a {
         let token = options
             .cancellation_token
             .unwrap_or_else(|| self.cancellation_token());
@@ -2560,11 +2763,36 @@ impl<W> WorkflowContext<W> {
         let mut cancelled = Box::pin(async move {
             wait_token.cancelled().await;
         });
+        let timer_cancel = WorkflowCancellationToken::new();
+        let mut timeout_timer = options.timeout.map(|duration| {
+            let mut timer_opts = TimerOptions::builder(duration).build();
+            timer_opts.cancellation_token = Some(timer_cancel.clone());
+            #[cfg(feature = "experimental")]
+            {
+                timer_opts.event_groups = options.event_groups;
+            }
+            Box::pin(self.timer(timer_opts))
+        });
         future::poll_fn(move |cx: &mut Context<'_>| {
             if condition(&*self.workflow_state.borrow()) {
-                Poll::Ready(Ok(()))
+                timer_cancel.cancel();
+                Poll::Ready(Ok(true))
             } else if cancelled.as_mut().poll(cx).is_ready() {
+                timer_cancel.cancel();
                 Poll::Ready(Err(WorkflowCancellationError::new(token.reason())))
+            } else if let Some(timer) = timeout_timer.as_mut() {
+                match timer.as_mut().poll(cx) {
+                    Poll::Ready(TimerResult::Fired) => Poll::Ready(Ok(false)),
+                    Poll::Ready(TimerResult::Cancelled) | Poll::Pending => {
+                        self.sync
+                            .base
+                            .inner
+                            .condition_wakers
+                            .borrow_mut()
+                            .push(cx.waker().clone());
+                        Poll::Pending
+                    }
+                }
             } else {
                 self.sync
                     .base
@@ -2919,7 +3147,7 @@ impl Future for LATimerBackoffFut {
                 cancellation_token: Some(self.cancellation_token.clone()),
                 summary: None,
                 #[cfg(feature = "experimental")]
-                event_group_markers: self.la_opts.event_group_markers.clone(),
+                event_groups: self.la_opts.event_groups.clone(),
             });
             self.timer_fut = Some(Box::pin(timer_f));
             self.next_attempt = b.attempt;
@@ -3578,11 +3806,39 @@ impl ExternalWorkflowHandle {
         &self,
         reason: Option<String>,
     ) -> impl FusedFuture<Output = CancelExternalWorkflowResult> {
+        #[cfg(feature = "experimental")]
+        {
+            self.cancel_with_options(CancelExternalWorkflowOptions {
+                reason,
+                event_groups: Vec::new(),
+            })
+        }
+        #[cfg(not(feature = "experimental"))]
+        {
+            self.base_ctx
+                .cancel_external_workflow(CancelExternalWorkflowInput {
+                    workflow_id: self.workflow_id.clone(),
+                    run_id: self.run_id.clone(),
+                    reason,
+                })
+        }
+    }
+
+    /// Request cancellation of the external workflow with additional options.
+    ///
+    /// This experimental API may change without notice.
+    #[cfg(feature = "experimental")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "experimental")))]
+    pub fn cancel_with_options(
+        &self,
+        options: CancelExternalWorkflowOptions,
+    ) -> impl FusedFuture<Output = CancelExternalWorkflowResult> {
         self.base_ctx
             .cancel_external_workflow(CancelExternalWorkflowInput {
                 workflow_id: self.workflow_id.clone(),
                 run_id: self.run_id.clone(),
-                reason,
+                reason: options.reason,
+                event_groups: options.event_groups,
             })
     }
 }
@@ -3608,7 +3864,7 @@ mod tests {
                 AsJsonPayloadExt, FromJsonPayloadExt,
                 common::VersioningIntent as ProtoVersioningIntent,
                 workflow_activation::{UpdateRandomSeed, WorkflowActivationJob},
-                workflow_commands::WorkflowCommand,
+                workflow_commands::{ContinueAsNewWorkflowExecution, WorkflowCommand},
             },
             temporal::api::{
                 common::v1::Payload,
@@ -3809,11 +4065,8 @@ mod tests {
     #[cfg(feature = "experimental")]
     mod experimental_operation_tests {
         use super::*;
-        use temporalio_common_wasm::protos::{
-            coresdk::workflow_activation::{
-                ResolveChildWorkflowExecutionStartSuccess, resolve_nexus_operation_start,
-            },
-            temporal::api::sdk::v1::{EventGroupMarker, event_group_marker},
+        use temporalio_common_wasm::protos::coresdk::workflow_activation::{
+            ResolveChildWorkflowExecutionStartSuccess, resolve_nexus_operation_start,
         };
 
         struct TestActivity;
@@ -3852,7 +4105,7 @@ mod tests {
                 duration: Duration::from_secs(1),
                 cancellation_token: Some(token.clone()),
                 summary: None,
-                event_group_markers: vec![],
+                event_groups: vec![],
             });
 
             let mut activity_options =
@@ -4069,17 +4322,10 @@ mod tests {
                 Vec::new(),
             );
             let token = WorkflowCancellationToken::new();
-            let marker = EventGroupMarker {
-                variant: Some(event_group_marker::Variant::Label(
-                    event_group_marker::Label {
-                        id: "la-group".to_string(),
-                        label: Some("la-group".as_json_payload().unwrap()),
-                    },
-                )),
-            };
+            let group = EventGroup::with_id("la-group", "la-group");
             let mut options = LocalActivityOptions {
                 schedule_to_close_timeout: Some(Duration::from_secs(10)),
-                event_group_markers: vec![marker.clone()],
+                event_groups: vec![group.clone()],
                 ..Default::default()
             };
             options.cancellation_token = Some(token.clone());
@@ -4117,7 +4363,7 @@ mod tests {
                     )
                 })
                 .expect("backoff StartTimer is issued");
-            assert_eq!(start_timer.event_group_markers, [marker]);
+            assert_eq!(start_timer.event_group_markers, [group.to_marker()]);
         }
     }
 
@@ -4644,8 +4890,8 @@ mod tests {
         };
 
         assert_eq!(
-            *cmd,
-            crate::runtime::types::ContinueAsNewRequest {
+            cmd.attributes,
+            ContinueAsNewWorkflowExecution {
                 workflow_type: TestWorkflow.name().to_string(),
                 task_queue: String::new(),
                 arguments: vec![7u8.as_json_payload().unwrap()],
@@ -4666,6 +4912,7 @@ mod tests {
     #[cfg(feature = "experimental")]
     mod experimental_continue_as_new_tests {
         use super::*;
+        use std::collections::HashSet;
         use temporalio_common_wasm::{
             RetryPolicy, protos::temporal::api::common::v1::RetryPolicy as ProtoRetryPolicy,
         };
@@ -4699,6 +4946,7 @@ mod tests {
                         initial_versioning_behavior: Some(
                             ContinueAsNewVersioningBehavior::UseRampingVersion,
                         ),
+                        event_groups: Vec::new(),
                     },
                 )
                 .expect_err("continue_as_new should terminate the workflow");
@@ -4711,8 +4959,8 @@ mod tests {
             };
 
             assert_eq!(
-                *cmd,
-                crate::runtime::types::ContinueAsNewRequest {
+                cmd.attributes,
+                ContinueAsNewWorkflowExecution {
                     workflow_type: "next-workflow".to_string(),
                     task_queue: "next-task-queue".to_string(),
                     arguments: vec![11u8.as_json_payload().unwrap()],
@@ -4761,6 +5009,39 @@ mod tests {
                 cmd.initial_versioning_behavior,
                 ProtoContinueAsNewVersioningBehavior::AutoUpgrade as i32
             );
+        }
+
+        #[test]
+        fn continue_as_new_merges_ambient_and_direct_event_groups() {
+            let ctx = test_context();
+            let direct = EventGroup::with_id("direct-label", "direct-id");
+            let scope = EventGroup::with_id("scope-label", "scope-id");
+            let scoped = ctx.with_event_group(scope);
+
+            let termination = scoped
+                .continue_as_new(
+                    7,
+                    ContinueAsNewOptions {
+                        event_groups: vec![direct],
+                        ..Default::default()
+                    },
+                )
+                .expect_err("continue_as_new should terminate the workflow");
+            let WorkflowTermination::ContinueAsNew(cmd) = termination else {
+                unreachable!()
+            };
+
+            let ids: HashSet<&str> = cmd
+                .event_group_markers
+                .iter()
+                .filter_map(|marker| match marker.variant.as_ref()? {
+                    temporalio_common_wasm::protos::temporal::api::sdk::v1::event_group_marker::Variant::Label(label) => {
+                        Some(label.id.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(ids, HashSet::from(["direct-id", "scope-id"]));
         }
     }
 
